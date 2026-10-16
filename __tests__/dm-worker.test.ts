@@ -6,6 +6,7 @@ const {
   mockSendPrivateReplyWithLinkButton,
   mockSendPrivateReplyWithButton,
   mockGetUserFollowStatus,
+  mockGetSenderProfile,
   mockSendDirectMessageWithButton,
   mockSendDirectMessage,
   mockSendDirectMessageWithLinkButton,
@@ -43,6 +44,7 @@ const {
   mockSendPrivateReplyWithLinkButton: vi.fn(),
   mockSendPrivateReplyWithButton: vi.fn(),
   mockGetUserFollowStatus: vi.fn(),
+  mockGetSenderProfile: vi.fn(),
   mockSendDirectMessageWithButton: vi.fn(),
   mockSendDirectMessage: vi.fn(),
   mockSendDirectMessageWithLinkButton: vi.fn(),
@@ -64,6 +66,7 @@ vi.mock("@/lib/meta/client", () => ({
   sendPrivateReplyWithLinkButton: mockSendPrivateReplyWithLinkButton,
   sendPrivateReplyWithButton: mockSendPrivateReplyWithButton,
   getUserFollowStatus: mockGetUserFollowStatus,
+  getSenderProfile: mockGetSenderProfile,
   sendDirectMessageWithButton: mockSendDirectMessageWithButton,
   sendDirectMessage: mockSendDirectMessage,
   sendDirectMessageWithLinkButton: mockSendDirectMessageWithLinkButton,
@@ -244,6 +247,7 @@ beforeEach(() => {
     workspaceId: "workspace_123",
   });
   mockPrisma.operationalEvent.create.mockResolvedValue({});
+  mockGetSenderProfile.mockReset().mockResolvedValue(null);
   mockDecryptToken.mockReturnValue("decrypted_token");
   mockMatchKeywords.mockReturnValue({ matched: true, matchedKeyword: "LINK" });
   mockReserveWorkspaceDMSend.mockResolvedValue({
@@ -1040,6 +1044,56 @@ describe("DM Worker — DM keyword trigger", () => {
     );
     // Never a private reply — there is no comment to reply to.
     expect(mockSendPrivateReply).not.toHaveBeenCalled();
+  });
+
+  it("asks Instagram for the handle on a first-contact Story reply", async () => {
+    // The messages webhook carries only the sender's IGSID, and a campaign
+    // created for a Story has no earlier log to reuse — which is every
+    // Story-reply campaign on its launch day.
+    mockPrisma.dmLog.findFirst.mockResolvedValue(null);
+    mockGetSenderProfile.mockResolvedValue({
+      username: "maria_lopez",
+      name: "María López",
+    });
+
+    const processor = getProcessor();
+    await processor(createMockMessageJob());
+
+    // Called through the provider wrapper, which unwraps the context into the
+    // Meta client's positional signature.
+    expect(mockGetSenderProfile).toHaveBeenCalledWith(
+      "decrypted_token",
+      "commenter_999"
+    );
+    expect(mockSendDirectMessage).toHaveBeenCalledWith(
+      "decrypted_token",
+      "ig_456",
+      "commenter_999",
+      "Hey maria_lopez! Here is the link: https://example.com"
+    );
+  });
+
+  it("still delivers when the handle cannot be resolved", async () => {
+    // A missing profile must degrade the greeting, never block the link.
+    mockPrisma.dmLog.findFirst.mockResolvedValue(null);
+    mockGetSenderProfile.mockResolvedValue(null);
+
+    const processor = getProcessor();
+    await processor(createMockMessageJob());
+
+    expect(mockSendDirectMessage).toHaveBeenCalledWith(
+      "decrypted_token",
+      "ig_456",
+      "commenter_999",
+      "Hey there! Here is the link: https://example.com"
+    );
+  });
+
+  it("does not pay for a lookup when a handle is already on file", async () => {
+    const processor = getProcessor();
+    await processor(createMockMessageJob());
+
+    expect(mockGetSenderProfile).not.toHaveBeenCalled();
   });
 
   it("should not reply when the DM text matches no keyword", async () => {

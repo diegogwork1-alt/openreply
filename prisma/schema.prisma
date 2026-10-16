@@ -186,6 +186,12 @@ model Automation {
   // postId / matchAnyPost do not apply to it.
   dmTriggerEnabled Boolean @default(false)
   dmMessage      String
+  // Variants of the reveal DM. With more than one, the worker picks at random
+  // per send, the same way publicReplyMessages already works: a single message
+  // repeated hundreds of times a day reads as a bot to both the recipient and
+  // Instagram. dmMessage stays the single-text field and is the fallback
+  // whenever this list is empty, so existing campaigns are unaffected.
+  dmMessages     String[] @default([])
   openingDmEnabled     Boolean @default(false)
   openingDmMessage     String?
   openingDmButtonLabel String?

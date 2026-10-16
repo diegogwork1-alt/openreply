@@ -2,6 +2,20 @@ import * as meta from "@/lib/meta/client";
 import { zernioRequest } from "@/lib/zernio/client";
 import type { InstagramContext, ZernioContext } from "./context";
 
+export async function getSenderProfile({
+  context,
+  senderId,
+}: {
+  context: InstagramContext;
+  senderId: string;
+}): Promise<{ username?: string; name?: string } | null> {
+  if (context.provider === "META")
+    return meta.getSenderProfile(context.accessToken, senderId);
+  // No Zernio equivalent is wired up, and guessing one would be worse than the
+  // existing fallback: the caller already handles a null here.
+  return null;
+}
+
 export async function getUserFollowStatus({
   context,
   recipientId,

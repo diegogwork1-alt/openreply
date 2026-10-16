@@ -37,6 +37,11 @@ const createAutomationSchema = z
     matchAnyWord: z.boolean().optional().default(false),
     dmTriggerEnabled: z.boolean().optional().default(false),
     dmMessage: z.string().min(1).max(1000),
+    dmMessages: z
+      .array(z.string().max(1000))
+      .max(10)
+      .optional()
+      .default([]),
     openingDmEnabled: z.boolean().optional().default(false),
     openingDmMessage: z.string().max(1000).optional().nullable(),
     openingDmButtonLabel: z.string().max(64).optional().nullable(),
@@ -100,6 +105,7 @@ const updateAutomationSchema = z.object({
   matchAnyWord: z.boolean().optional(),
   dmTriggerEnabled: z.boolean().optional(),
   dmMessage: z.string().min(1).max(1000).optional(),
+  dmMessages: z.array(z.string().max(1000)).max(10).optional(),
   openingDmEnabled: z.boolean().optional(),
   openingDmMessage: z.string().max(1000).optional().nullable(),
   openingDmButtonLabel: z.string().max(64).optional().nullable(),
@@ -361,6 +367,17 @@ export async function POST(request: NextRequest) {
     parsed.data;
   // A post is only stored for the "specific post" trigger.
   const isSpecificPost = !pendingNextReel && !matchAnyPost;
+  // Same shape as the public-reply list below: the variants win when present,
+  // the single field is the fallback. dmMessage is non-null in the schema, so
+  // it always keeps the first variant.
+  const dmList = (
+    parsed.data.dmMessages.length > 0
+      ? parsed.data.dmMessages
+      : [parsed.data.dmMessage]
+  )
+    .map((m) => m.trim())
+    .filter(Boolean);
+
   const publicReplyList = (
     parsed.data.publicReplyMessages.length > 0
       ? parsed.data.publicReplyMessages
@@ -383,7 +400,8 @@ export async function POST(request: NextRequest) {
       keywords: matchAnyWord ? [] : parsed.data.keywords,
       matchAnyWord,
       dmTriggerEnabled: parsed.data.dmTriggerEnabled,
-      dmMessage: parsed.data.dmMessage,
+      dmMessage: dmList[0] ?? parsed.data.dmMessage,
+      dmMessages: dmList,
       openingDmEnabled,
       openingDmMessage: openingDmEnabled
         ? parsed.data.openingDmMessage || null
@@ -510,6 +528,17 @@ export async function PATCH(request: NextRequest) {
   if (automationData.matchAnyPost === true || automationData.pendingNextReel === true) {
     automationData.postId = null;
     automationData.postUrl = null;
+  }
+  // Keep the DM variations list and the single field in sync. dmMessage is
+  // non-null, so an all-blank list is ignored rather than wiping the message.
+  if (automationData.dmMessages !== undefined) {
+    const list = automationData.dmMessages.map((m) => m.trim()).filter(Boolean);
+    if (list.length > 0) {
+      automationData.dmMessages = list;
+      automationData.dmMessage = list[0];
+    } else {
+      automationData.dmMessages = [];
+    }
   }
   // Keep the public-reply variations list and the legacy single field in sync.
   if (automationData.publicReplyMessages !== undefined) {

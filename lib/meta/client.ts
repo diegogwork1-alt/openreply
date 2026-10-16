@@ -261,6 +261,43 @@ export async function sendDirectMessageWithButton(
  * false, or `null` when Meta does not return the field — so callers can decide
  * how to treat the unverifiable case.
  */
+/**
+ * The display name and handle of someone who sent the account a DM.
+ *
+ * The messages webhook carries only the sender's IGSID — no username — so a
+ * campaign triggered by a DM or a Story reply has nothing to render
+ * `{username}` with and falls back to a generic greeting. A comment webhook,
+ * by contrast, includes `from.username`. This closes that gap by asking for
+ * the profile once; the caller is expected to store the result so the lookup
+ * does not repeat on every message from the same person.
+ *
+ * Fails soft to null for the same reason as the follow check below: a missing
+ * profile must degrade the greeting, never block the reply.
+ */
+export async function getSenderProfile(
+  accessToken: string,
+  senderId: string
+): Promise<{ username?: string; name?: string } | null> {
+  const url = new URL(`${instagramGraphBase()}/${senderId}`);
+  url.searchParams.set("fields", "name,username");
+
+  try {
+    const response = await fetch(url.toString(), {
+      method: "GET",
+      headers: { Authorization: `Bearer ${accessToken}` },
+    });
+    if (!response.ok) return null;
+    const data = await response.json();
+    const username =
+      typeof data?.username === "string" ? data.username : undefined;
+    const name = typeof data?.name === "string" ? data.name : undefined;
+    if (!username && !name) return null;
+    return { username, name };
+  } catch {
+    return null;
+  }
+}
+
 export async function getUserFollowStatus(
   accessToken: string,
   recipientId: string

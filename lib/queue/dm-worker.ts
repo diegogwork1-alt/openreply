@@ -24,6 +24,7 @@ import {
   MetaApiError,
   RateLimitError,
   TokenExpiredError,
+  getSenderProfile,
   getUserFollowStatus,
   sendCommentReply,
   sendDirectMessage,
@@ -183,8 +184,28 @@ function buildInlineLinkFallback(
   return extraUrls.length > 0 ? `${base}\n${extraUrls.join("\n")}` : base;
 }
 
+/**
+ * Pick the DM text for one send.
+ *
+ * Mirrors the public-reply pool: `dmMessages` wins when it has entries,
+ * `dmMessage` is the fallback so campaigns written before the field existed
+ * behave exactly as they did. Resolve it ONCE per send and thread the result
+ * through every branch — the button template and its inline-link fallback must
+ * carry the same text, or a template rejection would silently deliver a
+ * different variant than the one the recipient was about to get.
+ */
+export function pickDmMessage(automation: {
+  dmMessage: string;
+  dmMessages?: string[];
+}): string {
+  const pool = automation.dmMessages ?? [];
+  if (pool.length === 0) return automation.dmMessage;
+  return pool[Math.floor(Math.random() * pool.length)];
+}
+
 type RevealAutomation = {
   dmMessage: string;
+  dmMessages: string[];
   linkButtonLabel: string | null;
   trackedLinks: WorkerTrackedLink[];
   instagramAccount: { instagramId: string };
@@ -208,13 +229,16 @@ async function sendRevealDirectMessage({
   commenterName: string | null;
   context: string;
 }): Promise<void> {
+  // One pick per send, shared by every branch below.
+  const dmText = pickDmMessage(automation);
+
   if (automation.trackedLinks.length === 0) {
     await sendDirectMessage({
       context: accessToken,
       instagramAccountId: automation.instagramAccount.instagramId,
       userId: userId,
       message: renderMessageWithTracking({
-        message: automation.dmMessage,
+        message: dmText,
         commenterName,
         trackedLinks: automation.trackedLinks,
       }),
@@ -225,7 +249,7 @@ async function sendRevealDirectMessage({
   // Try button template first; if Meta rejects it, fall back to inline links.
   const bodyText =
     renderMessageWithoutLink({
-      message: automation.dmMessage,
+      message: dmText,
       commenterName,
     }) || "Here's your link:";
   const recipientToken = hashRecipientId(userId);
@@ -258,7 +282,7 @@ async function sendRevealDirectMessage({
         instagramAccountId: automation.instagramAccount.instagramId,
         userId: userId,
         message: buildInlineLinkFallback(
-          automation.dmMessage,
+          dmText,
           commenterName,
           automation.trackedLinks,
           bodyText,
@@ -661,6 +685,10 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
       await releaseWorkspaceDMReservation(automation.workspaceId, usage.periodStart);
       continue;
     }
+
+    // One pick per send: the button template and its inline fallback below
+    // have to carry the same variant.
+    const dmText = pickDmMessage(automation);
     let delivered = false;
     try {
       if (useOpeningDm) {
@@ -700,7 +728,7 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
         // Try button template first; if Meta rejects it, fall back to inline links.
         const bodyText =
           renderMessageWithoutLink({
-            message: automation.dmMessage,
+            message: dmText,
             commenterName,
           }) || "Here's your link:";
         const buttons = buildLinkButtons(
@@ -729,7 +757,7 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
             formatError(buttonError)
           );
           const fallbackMessage = buildInlineLinkFallback(
-            automation.dmMessage,
+            dmText,
             commenterName,
             automation.trackedLinks,
             bodyText,
@@ -749,7 +777,7 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
         }
       } else {
         const dmMessage = renderMessageWithTracking({
-          message: automation.dmMessage,
+          message: dmText,
           commenterName,
           trackedLinks: automation.trackedLinks,
           recipientToken: hashRecipientId(commenterId),
@@ -1389,11 +1417,31 @@ async function processMessage(job: Job<ProcessMessageJob>): Promise<void> {
 
     // Reuse a name captured on an earlier interaction so {username} still
     // renders — the messages webhook carries only the sender's IGSID.
+    //
+    // Scoped to the account, not the campaign: a person's handle does not
+    // change between campaigns, and the narrower lookup missed every first
+    // contact with a newly created campaign — which is every Story-reply
+    // campaign on its launch day, the case this path exists for.
     const priorLog = await prisma.dmLog.findFirst({
-      where: { automationId: automation.id, commenterId: senderId },
+      where: {
+        instagramAccountId: automation.instagramAccountId,
+        commenterId: senderId,
+        commenterName: { not: null },
+      },
       select: { commenterName: true },
     });
-    const commenterName = priorLog?.commenterName ?? null;
+    // Nothing on file: ask Instagram once. Without this the reveal greets a
+    // first-time Story replier with the generic fallback, in English, which
+    // reads as broken in any other language.
+    const commenterName =
+      priorLog?.commenterName ??
+      (
+        await getSenderProfile({
+          context: accessToken,
+          senderId,
+        })
+      )?.username ??
+      null;
 
     // Follow gate: anyone not confirmed as a follower gets the prompt instead of
     // the link, with the same `followcheck:` button that re-verifies on tap.
