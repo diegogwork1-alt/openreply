@@ -44,6 +44,11 @@ const createAutomationSchema = z
       .default([]),
     openingDmEnabled: z.boolean().optional().default(false),
     openingDmMessage: z.string().max(1000).optional().nullable(),
+    openingDmMessages: z
+      .array(z.string().max(1000))
+      .max(10)
+      .optional()
+      .default([]),
     openingDmButtonLabel: z.string().max(64).optional().nullable(),
     linkButtonLabel: z.string().max(20).optional().nullable(),
     requireFollow: z.boolean().optional().default(false),
@@ -89,7 +94,8 @@ const createAutomationSchema = z
   .refine(
     (d) =>
       !d.openingDmEnabled ||
-      (Boolean(d.openingDmMessage?.trim()) &&
+      ((Boolean(d.openingDmMessage?.trim()) ||
+        d.openingDmMessages.some((m) => m.trim())) &&
         Boolean(d.openingDmButtonLabel?.trim())),
     { message: "Opening DM needs a message and a button label", path: ["openingDmMessage"] }
   );
@@ -108,6 +114,7 @@ const updateAutomationSchema = z.object({
   dmMessages: z.array(z.string().max(1000)).max(10).optional(),
   openingDmEnabled: z.boolean().optional(),
   openingDmMessage: z.string().max(1000).optional().nullable(),
+  openingDmMessages: z.array(z.string().max(1000)).max(10).optional(),
   openingDmButtonLabel: z.string().max(64).optional().nullable(),
   linkButtonLabel: z.string().max(20).optional().nullable(),
   requireFollow: z.boolean().optional(),
@@ -378,6 +385,10 @@ export async function POST(request: NextRequest) {
     .map((m) => m.trim())
     .filter(Boolean);
 
+  const openingDmList = parsed.data.openingDmMessages
+    .map((m) => m.trim())
+    .filter(Boolean);
+
   const publicReplyList = (
     parsed.data.publicReplyMessages.length > 0
       ? parsed.data.publicReplyMessages
@@ -404,8 +415,9 @@ export async function POST(request: NextRequest) {
       dmMessages: dmList,
       openingDmEnabled,
       openingDmMessage: openingDmEnabled
-        ? parsed.data.openingDmMessage || null
+        ? openingDmList[0] ?? (parsed.data.openingDmMessage || null)
         : null,
+      openingDmMessages: openingDmEnabled ? openingDmList : [],
       openingDmButtonLabel: openingDmEnabled
         ? parsed.data.openingDmButtonLabel || null
         : null,
@@ -531,6 +543,18 @@ export async function PATCH(request: NextRequest) {
   }
   // Keep the DM variations list and the single field in sync. dmMessage is
   // non-null, so an all-blank list is ignored rather than wiping the message.
+  // Same sync as the DM pool. openingDmMessage is nullable, so an all-blank
+  // list clears both rather than being ignored.
+  if (automationData.openingDmMessages !== undefined) {
+    const list = automationData.openingDmMessages
+      .map((m) => m.trim())
+      .filter(Boolean);
+    automationData.openingDmMessages = list;
+    automationData.openingDmMessage = list[0] ?? null;
+  }
+  if (automationData.openingDmEnabled === false) {
+    automationData.openingDmMessages = [];
+  }
   if (automationData.dmMessages !== undefined) {
     const list = automationData.dmMessages.map((m) => m.trim()).filter(Boolean);
     if (list.length > 0) {

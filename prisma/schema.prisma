@@ -194,6 +194,11 @@ model Automation {
   dmMessages     String[] @default([])
   openingDmEnabled     Boolean @default(false)
   openingDmMessage     String?
+  // Variants of the opening DM, same contract as dmMessages: the pool wins
+  // when it has entries, openingDmMessage is the single-text field and the
+  // fallback. The opening is the first thing a commenter reads, so it is the
+  // line most worth varying.
+  openingDmMessages    String[] @default([])
   openingDmButtonLabel String?
   linkButtonLabel      String?
   requireFollow           Boolean @default(false)

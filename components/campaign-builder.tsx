@@ -42,6 +42,7 @@ interface LoadedCampaign {
   dmMessages: string[];
   openingDmEnabled: boolean;
   openingDmMessage: string | null;
+  openingDmMessages: string[];
   openingDmButtonLabel: string | null;
   linkButtonLabel: string | null;
   requireFollow: boolean;
@@ -166,7 +167,9 @@ export default function CampaignBuilder({ mode, campaignId }: CampaignBuilderPro
   const [publicReplyMessages, setPublicReplyMessages] = useState<string[]>([""]);
 
   const [openingDmEnabled, setOpeningDmEnabled] = useState(false);
-  const [openingDmMessage, setOpeningDmMessage] = useState("");
+  const [openingDmMessages, setOpeningDmMessages] = useState<string[]>([""]);
+  // The single-field shape the preview and the validation still expect.
+  const openingDmMessage = openingDmMessages.find((m) => m.trim()) ?? "";
   const [openingDmButtonLabel, setOpeningDmButtonLabel] = useState("");
 
   const [dmMessages, setDmMessages] = useState<string[]>([""]);
@@ -273,7 +276,11 @@ export default function CampaignBuilder({ mode, campaignId }: CampaignBuilderPro
               : [""]
         );
         setOpeningDmEnabled(c.openingDmEnabled);
-        setOpeningDmMessage(c.openingDmMessage ?? "");
+        setOpeningDmMessages(
+          c.openingDmMessages?.length
+            ? c.openingDmMessages
+            : [c.openingDmMessage ?? ""]
+        );
         setOpeningDmButtonLabel(c.openingDmButtonLabel ?? "");
         setDmMessages(c.dmMessages?.length ? c.dmMessages : [c.dmMessage]);
         setLinkButtonLabel(c.linkButtonLabel ?? "Open link");
@@ -339,7 +346,7 @@ export default function CampaignBuilder({ mode, campaignId }: CampaignBuilderPro
     setPublicReplyMessages(row.publicReply ? [row.publicReply] : [""]);
     const hasOpening = Boolean(row.openingDmMessage);
     setOpeningDmEnabled(hasOpening);
-    setOpeningDmMessage(row.openingDmMessage ?? "");
+    setOpeningDmMessages([row.openingDmMessage ?? ""]);
     setOpeningDmButtonLabel(
       row.openingDmButtonLabel || (hasOpening ? "Send link" : "")
     );
@@ -424,6 +431,9 @@ export default function CampaignBuilder({ mode, campaignId }: CampaignBuilderPro
       dmMessages: dmMessages.map((m) => m.trim()).filter(Boolean),
       openingDmEnabled,
       openingDmMessage: openingDmEnabled ? openingDmMessage : null,
+      openingDmMessages: openingDmEnabled
+        ? openingDmMessages.map((m) => m.trim()).filter(Boolean)
+        : [],
       openingDmButtonLabel: openingDmEnabled ? openingDmButtonLabel : null,
       publicReplyEnabled,
       publicReplyMessages: publicReplyEnabled
@@ -821,14 +831,50 @@ export default function CampaignBuilder({ mode, campaignId }: CampaignBuilderPro
             </div>
             {openingDmEnabled && (
               <div className="mt-3 space-y-2">
-                <textarea
-                  value={openingDmMessage}
-                  onChange={(e) => setOpeningDmMessage(e.target.value)}
-                  placeholder={t("Hey there! I'm so happy you're here 😊")}
-                  rows={3}
-                  className="w-full rounded-lg border border-border bg-surface px-3 py-2 text-sm text-foreground placeholder:text-zinc-500 focus:border-accent/40 focus:outline-none resize-none"
-                  maxLength={1000}
-                />
+                {openingDmMessages.map((msg, i) => (
+                  <div key={i} className="flex items-start gap-2">
+                    <textarea
+                      value={msg}
+                      onChange={(e) =>
+                        setOpeningDmMessages((prev) =>
+                          prev.map((m, idx) => (idx === i ? e.target.value : m))
+                        )
+                      }
+                      placeholder={t("Hey there! I'm so happy you're here 😊")}
+                      rows={3}
+                      className="w-full rounded-lg border border-border bg-surface px-3 py-2 text-sm text-foreground placeholder:text-zinc-500 focus:border-accent/40 focus:outline-none resize-none"
+                      maxLength={1000}
+                    />
+                    {openingDmMessages.length > 1 && (
+                      <button
+                        type="button"
+                        onClick={() =>
+                          setOpeningDmMessages((prev) =>
+                            prev.filter((_, idx) => idx !== i)
+                          )
+                        }
+                        className="shrink-0 px-2 py-2 text-muted hover:text-error"
+                        aria-label={t("Remove message")}
+                      >
+                        ✕
+                      </button>
+                    )}
+                  </div>
+                ))}
+                {openingDmMessages.length < 10 && (
+                  <button
+                    type="button"
+                    onClick={() => setOpeningDmMessages((prev) => [...prev, ""])}
+                    className="text-xs font-medium text-accent hover:underline"
+                  >
+                    {t("+ Add another message")}
+                  </button>
+                )}
+                {openingDmMessages.filter((m) => m.trim()).length > 1 && (
+                  <p className="text-xs text-muted">
+                    {t("One is picked at random each time, so DMs don't look identical.")}
+                  </p>
+                )}
                 <input
                   value={openingDmButtonLabel}
                   onChange={(e) => setOpeningDmButtonLabel(e.target.value)}

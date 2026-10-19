@@ -194,13 +194,30 @@ function buildInlineLinkFallback(
  * carry the same text, or a template rejection would silently deliver a
  * different variant than the one the recipient was about to get.
  */
+function pickVariant<T extends string>(single: T, pool: string[] | undefined): T {
+  const variants = pool ?? [];
+  if (variants.length === 0) return single;
+  return variants[Math.floor(Math.random() * variants.length)] as T;
+}
+
 export function pickDmMessage(automation: {
   dmMessage: string;
   dmMessages?: string[];
 }): string {
-  const pool = automation.dmMessages ?? [];
-  if (pool.length === 0) return automation.dmMessage;
-  return pool[Math.floor(Math.random() * pool.length)];
+  return pickVariant(automation.dmMessage, automation.dmMessages);
+}
+
+/**
+ * Pick the opening DM for one send. Same contract as pickDmMessage; separate
+ * function because the opening is optional and its single field is nullable.
+ */
+export function pickOpeningDmMessage(automation: {
+  openingDmMessage?: string | null;
+  openingDmMessages?: string[];
+}): string | null {
+  const pool = (automation.openingDmMessages ?? []).filter((m) => m.trim());
+  if (pool.length > 0) return pool[Math.floor(Math.random() * pool.length)];
+  return automation.openingDmMessage ?? null;
 }
 
 type RevealAutomation = {
@@ -650,9 +667,12 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
     // With an opening DM, the private reply is a button message; tapping it
     // fires a postback that delivers the reveal (see processPostback). Without
     // one, we send the reveal text directly as today.
+    // Picked once and reused by the gate below and the send: a second call
+    // would roll a different variant than the one the gate approved.
+    const openingDmText = pickOpeningDmMessage(automation);
     const useOpeningDm =
       automation.openingDmEnabled &&
-      Boolean(automation.openingDmMessage) &&
+      Boolean(openingDmText) &&
       Boolean(automation.openingDmButtonLabel);
 
     // Follow-gating: the link is revealed only after a follow. When an opening
@@ -693,7 +713,7 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
     try {
       if (useOpeningDm) {
         const openingText = renderMessageWithTracking({
-          message: automation.openingDmMessage as string,
+          message: openingDmText as string,
           commenterName,
           trackedLinks: [],
         });
