@@ -34,6 +34,10 @@ export interface ProcessCommentJob {
   // from. Campaigns are bound to that post, so both ids have to be matched.
   originalMediaId?: string;
   requeueAttempt?: number;
+  // Requeues caused by the account-protection limits (daily cap, pacing),
+  // counted separately from requeueAttempt so a paced send does not consume
+  // the hourly limiter's give-up budget.
+  safetyRequeue?: number;
   // Which path enqueued this comment. It is not copied to ProcessedComment or
   // used for reconciliation dedup.
   source?: CommentSource;

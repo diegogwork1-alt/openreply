@@ -7,6 +7,10 @@ const {
   mockSendPrivateReplyWithButton,
   mockGetUserFollowStatus,
   mockGetSenderProfile,
+  mockReserveDailySlot,
+  mockClaimPacingDelayMs,
+  mockAlreadyDmedPerson,
+  mockPauseAccountAndAlert,
   mockSendDirectMessageWithButton,
   mockSendDirectMessage,
   mockSendDirectMessageWithLinkButton,
@@ -45,6 +49,10 @@ const {
   mockSendPrivateReplyWithButton: vi.fn(),
   mockGetUserFollowStatus: vi.fn(),
   mockGetSenderProfile: vi.fn(),
+  mockReserveDailySlot: vi.fn(),
+  mockClaimPacingDelayMs: vi.fn(),
+  mockAlreadyDmedPerson: vi.fn(),
+  mockPauseAccountAndAlert: vi.fn(),
   mockSendDirectMessageWithButton: vi.fn(),
   mockSendDirectMessage: vi.fn(),
   mockSendDirectMessageWithLinkButton: vi.fn(),
@@ -103,6 +111,16 @@ vi.mock("@/lib/utils/keyword-matcher", () => ({
 vi.mock("@/lib/utils/rate-limiter", () => ({
   reserveDMSlot: mockReserveDMSlot,
   releaseDMSlot: mockReleaseDMSlot,
+}));
+
+vi.mock("@/lib/safety/send-guard", () => ({
+  reserveDailySlot: mockReserveDailySlot,
+  releaseDailySlot: vi.fn(),
+  claimPacingDelayMs: mockClaimPacingDelayMs,
+  alreadyDmedPerson: mockAlreadyDmedPerson,
+  isAccountRestrictionError: (e: unknown) =>
+    Boolean(e && typeof e === "object" && "restricted" in e),
+  pauseAccountAndAlert: mockPauseAccountAndAlert,
 }));
 
 vi.mock("@/lib/billing/usage", () => ({
@@ -248,6 +266,12 @@ beforeEach(() => {
   });
   mockPrisma.operationalEvent.create.mockResolvedValue({});
   mockGetSenderProfile.mockReset().mockResolvedValue(null);
+  mockReserveDailySlot
+    .mockReset()
+    .mockResolvedValue({ allowed: true, used: 0, limit: 0, resetInMs: 0 });
+  mockClaimPacingDelayMs.mockReset().mockResolvedValue(0);
+  mockAlreadyDmedPerson.mockReset().mockResolvedValue(false);
+  mockPauseAccountAndAlert.mockReset().mockResolvedValue(false);
   mockDecryptToken.mockReturnValue("decrypted_token");
   mockMatchKeywords.mockReturnValue({ matched: true, matchedKeyword: "LINK" });
   mockReserveWorkspaceDMSend.mockResolvedValue({
@@ -901,6 +925,111 @@ describe("DM Worker — Full Pipeline", () => {
         update: expect.objectContaining({ status: "FAILED" }),
       })
     );
+  });
+});
+
+describe("DM Worker — account-protection limits", () => {
+  it("holds the DM when the daily cap is reached, and retries after the reset", async () => {
+    mockReserveDailySlot.mockResolvedValue({
+      allowed: false,
+      used: 50,
+      limit: 50,
+      resetInMs: 3_600_000,
+    });
+
+    const processor = getProcessor();
+    await processor(createMockJob());
+
+    expect(mockSendPrivateReply).not.toHaveBeenCalled();
+    // The hourly slot it had already taken must go back, or a capped day
+    // would also burn the next hour's budget.
+    expect(mockReleaseDMSlot).toHaveBeenCalledWith("ig_456");
+    expect(mockQueueAdd).toHaveBeenCalledWith(
+      "process-comment",
+      expect.objectContaining({ safetyRequeue: 1 }),
+      expect.objectContaining({
+        jobId: "comment_ig_456_comment_555_daily_1",
+      })
+    );
+  });
+
+  it("gives up on the daily cap rather than requeueing forever", async () => {
+    mockReserveDailySlot.mockResolvedValue({
+      allowed: false,
+      used: 50,
+      limit: 50,
+      resetInMs: 3_600_000,
+    });
+
+    const processor = getProcessor();
+    await processor(createMockJob({ safetyRequeue: 5 }));
+
+    expect(mockQueueAdd).not.toHaveBeenCalled();
+    expect(mockPrisma.dmLog.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ status: "SKIPPED_RATE_LIMIT" }),
+      })
+    );
+  });
+
+  it("spaces sends out instead of answering a burst all at once", async () => {
+    mockClaimPacingDelayMs.mockResolvedValue(45_000);
+
+    const processor = getProcessor();
+    await processor(createMockJob());
+
+    expect(mockSendPrivateReply).not.toHaveBeenCalled();
+    expect(mockQueueAdd).toHaveBeenCalledWith(
+      "process-comment",
+      expect.objectContaining({ safetyRequeue: 1 }),
+      expect.objectContaining({
+        delay: 45_000,
+        jobId: "comment_ig_456_comment_555_pace_1",
+      })
+    );
+  });
+
+  it("never DMs the same person twice for one campaign", async () => {
+    mockAlreadyDmedPerson.mockResolvedValue(true);
+
+    const processor = getProcessor();
+    await processor(createMockJob());
+
+    expect(mockSendPrivateReply).not.toHaveBeenCalled();
+    expect(mockSendPrivateReplyWithLinkButton).not.toHaveBeenCalled();
+    expect(mockPrisma.dmLog.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ status: "SKIPPED_DEDUP" }),
+      })
+    );
+    // Dedup happens before any budget is taken.
+    expect(mockReserveDMSlot).not.toHaveBeenCalled();
+  });
+
+  it("pauses the whole account when Instagram pushes back at it", async () => {
+    const restriction = Object.assign(new Error("blocked"), { restricted: true });
+    mockSendPrivateReply.mockRejectedValue(restriction);
+    mockSendPrivateReplyWithLinkButton.mockRejectedValue(restriction);
+
+    const processor = getProcessor();
+    await expect(processor(createMockJob())).rejects.toBeDefined();
+
+    expect(mockPauseAccountAndAlert).toHaveBeenCalledWith(
+      "ig_456",
+      expect.any(String)
+    );
+  });
+
+  it("does not pause for an ordinary send failure", async () => {
+    mockSendPrivateReply.mockRejectedValue(new Error("window closed"));
+    mockSendPrivateReplyWithLinkButton.mockRejectedValue(
+      new Error("window closed")
+    );
+
+    const processor = getProcessor();
+    await expect(processor(createMockJob())).rejects.toBeDefined();
+
+    expect(mockPauseAccountAndAlert).not.toHaveBeenCalled();
   });
 });
 

@@ -42,6 +42,14 @@ import {
 import { matchKeywords } from "@/lib/utils/keyword-matcher";
 import { reserveDMSlot, releaseDMSlot } from "@/lib/utils/rate-limiter";
 import {
+  alreadyDmedPerson,
+  claimPacingDelayMs,
+  isAccountRestrictionError,
+  pauseAccountAndAlert,
+  releaseDailySlot,
+  reserveDailySlot,
+} from "@/lib/safety/send-guard";
+import {
   releaseWorkspaceDMReservation,
   reserveWorkspaceDMSend,
 } from "@/lib/billing/usage";
@@ -548,6 +556,23 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
     // for a private reply". Skip them explicitly instead of burning an API call
     // and logging a failure the user can do nothing about. The public reply
     // above still goes out per campaign — only the DM leg is deduped.
+    // One DM per person per campaign. The check below dedups the same
+    // COMMENT across campaigns; this one stops the same PERSON being answered
+    // twice by the same campaign, which from their side is just spam.
+    if (await alreadyDmedPerson(automation.id, commenterId)) {
+      await prisma.dmLog.update({
+        where: {
+          automationId_commentId: { automationId: automation.id, commentId },
+        },
+        data: {
+          status: "SKIPPED_DEDUP",
+          matchedKeyword: matchResult.matchedKeyword,
+          errorMessage: "Already DMed this person for this campaign",
+        },
+      });
+      continue;
+    }
+
     const privateReplyUsedBy = await prisma.dmLog.findFirst({
       where: {
         commentId,
@@ -662,6 +687,78 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
         );
         continue;
       }
+    }
+
+    // Daily cap and pacing, both off unless configured. They sit after the
+    // hourly reservation so a blocked send hands that slot straight back.
+    const safetyRequeue = (job.data.safetyRequeue as number | undefined) ?? 0;
+    const MAX_SAFETY_REQUEUES = 5;
+
+    const daily = await reserveDailySlot(instagramAccountId);
+    if (!daily.allowed) {
+      if (rateLimit?.reserved) await releaseDMSlot(instagramAccountId);
+      await releaseWorkspaceDMReservation(
+        automation.workspaceId,
+        usage.periodStart
+      );
+      const giveUp = safetyRequeue >= MAX_SAFETY_REQUEUES;
+      await prisma.dmLog.update({
+        where: {
+          automationId_commentId: { automationId: automation.id, commentId },
+        },
+        data: {
+          status: giveUp ? "SKIPPED_RATE_LIMIT" : "PENDING",
+          matchedKeyword: matchResult.matchedKeyword,
+          errorMessage: `Daily cap reached (${daily.used}/${daily.limit})${giveUp ? "; given up" : "; retry after reset"}`,
+        },
+      });
+      if (!giveUp) {
+        await getDMQueue().add(
+          "process-comment",
+          { ...job.data, safetyRequeue: safetyRequeue + 1 },
+          {
+            delay: daily.resetInMs + Math.floor(Math.random() * 300_000),
+            jobId: `comment_${instagramAccountId}_${commentId}_daily_${safetyRequeue + 1}`,
+          }
+        );
+      }
+      continue;
+    }
+
+    const paceDelayMs = await claimPacingDelayMs(instagramAccountId);
+    if (paceDelayMs > 0) {
+      // The slot is claimed for a moment in the future, so hand back the
+      // reservations and let the requeued job take its own.
+      if (rateLimit?.reserved) await releaseDMSlot(instagramAccountId);
+      await releaseDailySlot(instagramAccountId);
+      await releaseWorkspaceDMReservation(
+        automation.workspaceId,
+        usage.periodStart
+      );
+      const giveUp = safetyRequeue >= MAX_SAFETY_REQUEUES;
+      await prisma.dmLog.update({
+        where: {
+          automationId_commentId: { automationId: automation.id, commentId },
+        },
+        data: {
+          status: giveUp ? "SKIPPED_RATE_LIMIT" : "PENDING",
+          matchedKeyword: matchResult.matchedKeyword,
+          errorMessage: giveUp
+            ? "Pacing retries exhausted"
+            : `Paced; sending in ${Math.round(paceDelayMs / 1000)}s`,
+        },
+      });
+      if (!giveUp) {
+        await getDMQueue().add(
+          "process-comment",
+          { ...job.data, safetyRequeue: safetyRequeue + 1 },
+          {
+            delay: paceDelayMs,
+            jobId: `comment_${instagramAccountId}_${commentId}_pace_${safetyRequeue + 1}`,
+          }
+        );
+      }
+      continue;
     }
 
     // With an opening DM, the private reply is a button message; tapping it
@@ -831,7 +928,15 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
       // Retain reservations if the provider may have delivered the message.
       if (isConfirmedSendRejection(sendError)) {
         if (rateLimit?.reserved) await releaseDMSlot(instagramAccountId);
+        await releaseDailySlot(instagramAccountId);
         await releaseWorkspaceDMReservation(automation.workspaceId, usage.periodStart);
+      }
+      // When the platform pushes back at the ACCOUNT, stop sending entirely
+      // rather than retrying more slowly: every further attempt deepens
+      // whatever triggered it. Checked on the raw error, because
+      // classifySendError wraps anything uncertain and would hide the code.
+      if (isAccountRestrictionError(error)) {
+        await pauseAccountAndAlert(instagramAccountId, formatError(error));
       }
       await prisma.dmLog.update({
         where: { automationId_commentId: { automationId: automation.id, commentId } },

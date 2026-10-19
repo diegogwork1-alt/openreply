@@ -16,7 +16,16 @@
 
 import Redis from "ioredis";
 
-const RATE_LIMIT_MAX = 750; // private replies per hour, per Meta's documented cap
+// Meta's documented cap is 750/hour. That is the refusal line, not a safe
+// operating speed for a young account, so it can be lowered per instance with
+// DM_RATE_LIMIT_PER_HOUR. Unset keeps the documented cap, as before.
+function resolveHourlyMax(): number {
+  const raw = process.env.DM_RATE_LIMIT_PER_HOUR;
+  if (!raw) return 750;
+  const value = Number.parseInt(raw, 10);
+  return Number.isFinite(value) && value > 0 ? Math.min(value, 750) : 750;
+}
+const RATE_LIMIT_MAX = resolveHourlyMax();
 const RATE_LIMIT_WINDOW = 3600; // 1 hour in seconds
 const REQUEUE_DELAY_MS = 30 * 60 * 1000; // 30 minutes
 const MAX_REQUEUE_ATTEMPTS = 3;
