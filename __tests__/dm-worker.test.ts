@@ -8,6 +8,7 @@ const {
   mockGetUserFollowStatus,
   mockGetSenderProfile,
   mockReserveDailySlot,
+  mockCheckHourlyWarmup,
   mockClaimPacingDelayMs,
   mockAlreadyDmedPerson,
   mockPauseAccountAndAlert,
@@ -50,6 +51,7 @@ const {
   mockGetUserFollowStatus: vi.fn(),
   mockGetSenderProfile: vi.fn(),
   mockReserveDailySlot: vi.fn(),
+  mockCheckHourlyWarmup: vi.fn(),
   mockClaimPacingDelayMs: vi.fn(),
   mockAlreadyDmedPerson: vi.fn(),
   mockPauseAccountAndAlert: vi.fn(),
@@ -115,6 +117,7 @@ vi.mock("@/lib/utils/rate-limiter", () => ({
 
 vi.mock("@/lib/safety/send-guard", () => ({
   reserveDailySlot: mockReserveDailySlot,
+  checkHourlyWarmup: mockCheckHourlyWarmup,
   releaseDailySlot: vi.fn(),
   claimPacingDelayMs: mockClaimPacingDelayMs,
   alreadyDmedPerson: mockAlreadyDmedPerson,
@@ -269,6 +272,9 @@ beforeEach(() => {
   mockReserveDailySlot
     .mockReset()
     .mockResolvedValue({ allowed: true, used: 0, limit: 0, resetInMs: 0 });
+  mockCheckHourlyWarmup
+    .mockReset()
+    .mockResolvedValue({ allowed: true, used: 0, limit: 0 });
   mockClaimPacingDelayMs.mockReset().mockResolvedValue(0);
   mockAlreadyDmedPerson.mockReset().mockResolvedValue(false);
   mockPauseAccountAndAlert.mockReset().mockResolvedValue(false);
@@ -929,6 +935,24 @@ describe("DM Worker — Full Pipeline", () => {
 });
 
 describe("DM Worker — account-protection limits", () => {
+  it("holds the DM at the warm-up hourly ceiling without burning a slot", async () => {
+    mockCheckHourlyWarmup.mockResolvedValue({ allowed: false, used: 10, limit: 10 });
+
+    const processor = getProcessor();
+    await processor(createMockJob());
+
+    expect(mockSendPrivateReply).not.toHaveBeenCalled();
+    // Checked before the reservation, so there is nothing to hand back.
+    expect(mockReserveDMSlot).not.toHaveBeenCalled();
+    expect(mockQueueAdd).toHaveBeenCalledWith(
+      "process-comment",
+      expect.objectContaining({ safetyRequeue: 1 }),
+      expect.objectContaining({
+        jobId: "comment_ig_456_comment_555_warmup_1",
+      })
+    );
+  });
+
   it("holds the DM when the daily cap is reached, and retries after the reset", async () => {
     mockReserveDailySlot.mockResolvedValue({
       allowed: false,

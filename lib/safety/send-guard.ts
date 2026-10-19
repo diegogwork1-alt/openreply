@@ -36,41 +36,123 @@ function envInt(name: string, fallback: number): number {
 }
 
 // ---------------------------------------------------------------------------
-// Daily cap, with an optional warm-up ramp
+// Account age, and limits that ramp with it
 // ---------------------------------------------------------------------------
 
-/**
- * The cap for today. `DM_DAILY_LIMIT_RAMP` is a comma-separated list read by
- * the account's age in days since its first delivered DM: "50,50,50,100,200"
- * means 50/day for three days, then 100, then 200, then the last value
- * forever. The ramp exists so nobody has to remember to raise a number by
- * hand on day four — a forgotten bump is either a throttled launch or, worse,
- * a jump to full speed that was meant to be gradual.
- *
- * 0 (the default) means no daily cap.
- */
-export async function getDailyLimit(
-  instagramAccountId: string
-): Promise<number> {
-  const ramp = (process.env.DM_DAILY_LIMIT_RAMP ?? "")
-    .split(",")
-    .map((v) => Number.parseInt(v.trim(), 10))
-    .filter((v) => Number.isFinite(v) && v > 0);
+// The age query runs on the hot send path, so it is cached briefly. A few
+// minutes of staleness cannot matter: the value only changes at a day
+// boundary.
+const AGE_CACHE_MS = 5 * 60 * 1000;
+const ageCache = new Map<string, { days: number | null; readAt: number }>();
 
-  if (ramp.length === 0) return envInt("DM_DAILY_LIMIT", 0);
+/** Drop the cached ages. Exported for tests; the TTL handles production. */
+export function clearAccountAgeCache(): void {
+  ageCache.clear();
+}
+
+/**
+ * Days since this account's first delivered DM, or null if it has never sent
+ * one. Day 0 is the first day of sending.
+ */
+export async function getAccountSendingAgeDays(
+  instagramAccountId: string
+): Promise<number | null> {
+  const cached = ageCache.get(instagramAccountId);
+  if (cached && Date.now() - cached.readAt < AGE_CACHE_MS) return cached.days;
 
   const first = await prisma.dmLog.findFirst({
     where: { instagramAccountId, status: "SENT" },
     orderBy: { dmSentAt: "asc" },
     select: { dmSentAt: true },
   });
-  // Nothing sent yet: day zero, the most cautious rung.
-  if (!first?.dmSentAt) return ramp[0];
+  const days = first?.dmSentAt
+    ? Math.floor((Date.now() - first.dmSentAt.getTime()) / 86_400_000)
+    : null;
+  ageCache.set(instagramAccountId, { days, readAt: Date.now() });
+  return days;
+}
 
-  const days = Math.floor(
-    (Date.now() - first.dmSentAt.getTime()) / 86_400_000
+/**
+ * Read a limit that warms up with the account.
+ *
+ * A ramp is a comma-separated list read by the account's age in days:
+ * "10,15,20,30" means 10 on the first day of sending, 15 on the second, and
+ * the last value from the fourth day on. Before anything has been sent the
+ * first rung applies.
+ *
+ * Volume is only half of what makes automation look like automation; the other
+ * half is speed. A cap that lets an account send 60 an hour on day one has not
+ * warmed anything up, it has just capped the total — which is why the hourly
+ * ceiling and the gap between sends ramp here too, not just the daily cap.
+ */
+async function rampedValue(
+  instagramAccountId: string,
+  rampEnv: string,
+  flatEnv: string,
+  flatDefault: number
+): Promise<number> {
+  const ramp = (process.env[rampEnv] ?? "")
+    .split(",")
+    .map((v) => Number.parseInt(v.trim(), 10))
+    .filter((v) => Number.isFinite(v) && v > 0);
+
+  if (ramp.length === 0) return envInt(flatEnv, flatDefault);
+
+  const days = await getAccountSendingAgeDays(instagramAccountId);
+  const index = days === null ? 0 : Math.min(days, ramp.length - 1);
+  return ramp[index];
+}
+
+/** The daily cap for today. 0 means no daily cap. */
+export async function getDailyLimit(
+  instagramAccountId: string
+): Promise<number> {
+  return rampedValue(
+    instagramAccountId,
+    "DM_DAILY_LIMIT_RAMP",
+    "DM_DAILY_LIMIT",
+    0
   );
-  return ramp[Math.min(days, ramp.length - 1)];
+}
+
+/**
+ * The hourly ceiling for today, which may be lower than the built-in limiter's.
+ *
+ * This does NOT keep its own counter: it reads the one the built-in limiter
+ * already maintains and holds it to a stricter, age-dependent line. Two
+ * counters would double-count every send.
+ *
+ * 0 means no warm-up ceiling — the built-in limiter governs alone.
+ */
+export async function getHourlyWarmupLimit(
+  instagramAccountId: string
+): Promise<number> {
+  return rampedValue(
+    instagramAccountId,
+    "DM_RATE_LIMIT_PER_HOUR_RAMP",
+    "DM_RATE_LIMIT_PER_HOUR_WARMUP",
+    0
+  );
+}
+
+export interface HourlyWarmup {
+  allowed: boolean;
+  used: number;
+  limit: number;
+}
+
+/**
+ * Whether the account is still under its warm-up hourly ceiling.
+ * Read-only on purpose; the built-in limiter owns the increment.
+ */
+export async function checkHourlyWarmup(
+  instagramAccountId: string
+): Promise<HourlyWarmup> {
+  const limit = await getHourlyWarmupLimit(instagramAccountId);
+  if (limit === 0) return { allowed: true, used: 0, limit: 0 };
+  const raw = await getRedis().get(`rate:dm:${instagramAccountId}`);
+  const used = raw ? Number.parseInt(raw, 10) : 0;
+  return { allowed: used < limit, used, limit };
 }
 
 function dayKey(instagramAccountId: string): string {
@@ -166,10 +248,20 @@ return next_at - now
 export async function claimPacingDelayMs(
   instagramAccountId: string
 ): Promise<number> {
-  const baseSeconds = envInt("DM_MIN_SPACING_SECONDS", 0);
+  const baseSeconds = await rampedValue(
+    instagramAccountId,
+    "DM_MIN_SPACING_SECONDS_RAMP",
+    "DM_MIN_SPACING_SECONDS",
+    0
+  );
   if (baseSeconds === 0) return 0;
 
-  const jitterSeconds = envInt("DM_SPACING_JITTER_SECONDS", 0);
+  // The jitter scales with the gap: a 5-minute warm-up gap wants minutes of
+  // variation, a 45-second steady-state gap wants seconds.
+  const jitterSeconds = envInt(
+    "DM_SPACING_JITTER_SECONDS",
+    Math.round(baseSeconds / 2)
+  );
   const spacingMs =
     baseSeconds * 1000 + Math.floor(Math.random() * (jitterSeconds * 1000 + 1));
 

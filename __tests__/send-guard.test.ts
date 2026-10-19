@@ -7,6 +7,7 @@ vi.mock("@/lib/db/client", () => ({
 }));
 
 import {
+  clearAccountAgeCache,
   getDailyLimit,
   isAccountRestrictionError,
 } from "@/lib/safety/send-guard";
@@ -20,6 +21,8 @@ const ORIGINAL_ENV = { ...process.env };
 
 beforeEach(() => {
   mockFindFirst.mockReset().mockResolvedValue(null);
+  // The age lookup is cached on the send path; tests move the clock around.
+  clearAccountAgeCache();
 });
 
 afterEach(() => {
@@ -84,8 +87,10 @@ describe("getDailyLimit", () => {
 
     mockFindFirst.mockResolvedValue({ dmSentAt: daysAgo(0) });
     expect(await getDailyLimit("acc_1")).toBe(50);
+    clearAccountAgeCache();
     mockFindFirst.mockResolvedValue({ dmSentAt: daysAgo(3) });
     expect(await getDailyLimit("acc_1")).toBe(100);
+    clearAccountAgeCache();
     mockFindFirst.mockResolvedValue({ dmSentAt: daysAgo(4) });
     expect(await getDailyLimit("acc_1")).toBe(200);
   });

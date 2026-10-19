@@ -43,6 +43,7 @@ import { matchKeywords } from "@/lib/utils/keyword-matcher";
 import { reserveDMSlot, releaseDMSlot } from "@/lib/utils/rate-limiter";
 import {
   alreadyDmedPerson,
+  checkHourlyWarmup,
   claimPacingDelayMs,
   isAccountRestrictionError,
   pauseAccountAndAlert,
@@ -610,6 +611,39 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
           errorMessage: `Monthly DM limit reached (${usage.limit})`,
         },
       });
+      continue;
+    }
+
+    // Warm-up ceiling, checked before the reservation so a blocked send never
+    // consumes an hourly slot. Read-only: the limiter below owns the counter.
+    const warmupRequeue = (job.data.safetyRequeue as number | undefined) ?? 0;
+    const warmup = await checkHourlyWarmup(instagramAccountId);
+    if (!warmup.allowed) {
+      await releaseWorkspaceDMReservation(
+        automation.workspaceId,
+        usage.periodStart
+      );
+      const giveUp = warmupRequeue >= 5;
+      await prisma.dmLog.update({
+        where: {
+          automationId_commentId: { automationId: automation.id, commentId },
+        },
+        data: {
+          status: giveUp ? "SKIPPED_RATE_LIMIT" : "PENDING",
+          matchedKeyword: matchResult.matchedKeyword,
+          errorMessage: `Warm-up hourly ceiling reached (${warmup.used}/${warmup.limit})${giveUp ? "; given up" : "; retry scheduled"}`,
+        },
+      });
+      if (!giveUp) {
+        await getDMQueue().add(
+          "process-comment",
+          { ...job.data, safetyRequeue: warmupRequeue + 1 },
+          {
+            delay: 10 * 60_000 + Math.floor(Math.random() * 300_000),
+            jobId: `comment_${instagramAccountId}_${commentId}_warmup_${warmupRequeue + 1}`,
+          }
+        );
+      }
       continue;
     }
 
